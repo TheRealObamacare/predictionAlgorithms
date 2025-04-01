@@ -1,6 +1,5 @@
 # Stock Data Retrieval Module
 # This module provides functions to fetch stock data from Yahoo Finance and TradingView
-
 import yfinance as yf
 import pandas as pd
 import datetime
@@ -91,7 +90,6 @@ def get_tradingview_technical_indicators(ticker, exchange="NASDAQ", screener="am
         # Import the tradingview-ta library
         from tradingview_ta import TA_Handler, Interval
         
-        # Map interval string to tradingview-ta Interval enum
         interval_map = {
             "1m": Interval.INTERVAL_1_MINUTE,
             "5m": Interval.INTERVAL_5_MINUTES,
