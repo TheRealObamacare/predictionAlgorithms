@@ -178,18 +178,23 @@ def get_tradingview_technical_indicators(ticker, exchange="NASDAQ", screener="am
         return None
 
 # Data Collection and File Creation Functions
-def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NASDAQ", screener="america", output_format="csv"):
+def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NASDAQ", screener="america", output_format="csv", start_date=None, end_date=None):
     """
-    Collect stock data from Yahoo Finance and TradingView, then save it to a file named after the ticker
-    in the 'stockData' folder.
+    Collect stock data from Yahoo Finance and calculate technical indicators directly on historical data,
+    then save it to a file named after the ticker in the 'stockData' folder.
     
     Parameters:
     ticker (str): Stock symbol (e.g., 'AAPL', 'MSFT')
     period (str): Valid periods: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+                  Note: This parameter is ignored if start_date is provided
     interval (str): Valid intervals: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
     exchange (str): Exchange name (e.g., 'NASDAQ', 'NYSE')
     screener (str): Screener to use (e.g., 'america', 'japan')
     output_format (str): Format to save data ('csv' or 'json')
+    start_date (str): Start date for historical data in 'YYYY-MM-DD' format (e.g., '2020-01-01')
+                      If provided, period parameter is ignored
+    end_date (str): End date for historical data in 'YYYY-MM-DD' format (e.g., '2023-12-31')
+                    If not provided and start_date is provided, defaults to current date
     
     Returns:
     str: Path to the created file
@@ -223,26 +228,65 @@ def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NA
             print(f"Error: Could not retrieve stock info for {ticker}")
             return None
         
-        # Get technical indicators from TradingView
-        try:
-            tech_indicators = get_tradingview_technical_indicators(ticker, exchange, screener, interval)
-        except Exception as e:
-            print(f"Warning: Could not retrieve TradingView data for {ticker}: {e}")
-            tech_indicators = None
+        # Calculate technical indicators directly on the historical data
+        # This ensures each historical data point has its own indicator values
+        # rather than applying current indicator values to all historical data
         
-        # Format the data for prediction algorithms
-        # Add technical indicators as columns to the historical data
-        if tech_indicators is not None:
-            # Extract key technical indicators
-            for category in ['Oscillators', 'Moving Averages']:
-                for key, value in tech_indicators[category].items():
-                    if key not in ['RECOMMENDATION', 'BUY', 'SELL', 'NEUTRAL']:
-                        try:
-                            # Convert to float if possible
-                            hist_data[f"{category}_{key}"] = float(value)
-                        except (ValueError, TypeError):
-                            # Keep as string if not convertible to float
-                            hist_data[f"{category}_{key}"] = value
+        # Create copies of the dataframe for technical indicator calculations
+        df = hist_data.copy()
+        
+        # Calculate RSI (14-period)
+        delta = df['Close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['Oscillators_RSI'] = 100 - (100 / (1 + rs))
+        
+        # Calculate RSI[1] (previous period RSI)
+        df['Oscillators_RSI[1]'] = df['Oscillators_RSI'].shift(1)
+        
+        # Calculate Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Oscillators_STOCH.K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Oscillators_STOCH.D'] = df['Oscillators_STOCH.K'].rolling(window=3).mean()
+        
+        # Calculate CCI (Commodity Channel Index)
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        moving_avg_20 = typical_price.rolling(window=20).mean()
+        mean_deviation = abs(typical_price - moving_avg_20).rolling(window=20).mean()
+        df['Oscillators_CCI'] = (typical_price - moving_avg_20) / (0.015 * mean_deviation)
+        
+        # Calculate MACD
+        ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['Oscillators_MACD.macd'] = ema_12 - ema_26
+        df['Oscillators_MACD.signal'] = df['Oscillators_MACD.macd'].ewm(span=9, adjust=False).mean()
+        
+        # Calculate Moving Averages
+        # EMA
+        df['Moving Averages_EMA5'] = df['Close'].ewm(span=5, adjust=False).mean()
+        df['Moving Averages_EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['Moving Averages_EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['Moving Averages_EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['Moving Averages_EMA100'] = df['Close'].ewm(span=100, adjust=False).mean()
+        df['Moving Averages_EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        
+        # SMA
+        df['Moving Averages_SMA5'] = df['Close'].rolling(window=5).mean()
+        df['Moving Averages_SMA10'] = df['Close'].rolling(window=10).mean()
+        df['Moving Averages_SMA20'] = df['Close'].rolling(window=20).mean()
+        df['Moving Averages_SMA50'] = df['Close'].rolling(window=50).mean()
+        df['Moving Averages_SMA100'] = df['Close'].rolling(window=100).mean()
+        df['Moving Averages_SMA200'] = df['Close'].rolling(window=200).mean()
+        
+        # Replace NaN values with 'N/A' string
+        df = df.fillna('N/A')
+        
+        # Update the historical data with calculated indicators
+        hist_data = df
         
         # Add some key stock info as columns
         key_info_fields = [
@@ -337,26 +381,65 @@ def collect_and_save_backtest_data(ticker, period="5y", interval="1d", exchange=
             print(f"Error: Could not retrieve stock info for {ticker}")
             return None
         
-        # Get technical indicators from TradingView
-        try:
-            tech_indicators = get_tradingview_technical_indicators(ticker, exchange, screener, interval)
-        except Exception as e:
-            print(f"Warning: Could not retrieve TradingView data for {ticker}: {e}")
-            tech_indicators = None
+        # Calculate technical indicators directly on the historical data
+        # This ensures each historical data point has its own indicator values
+        # rather than applying current indicator values to all historical data
         
-        # Format the data for prediction algorithms
-        # Add technical indicators as columns to the historical data
-        if tech_indicators is not None:
-            # Extract key technical indicators
-            for category in ['Oscillators', 'Moving Averages']:
-                for key, value in tech_indicators[category].items():
-                    if key not in ['RECOMMENDATION', 'BUY', 'SELL', 'NEUTRAL']:
-                        try:
-                            # Convert to float if possible
-                            hist_data[f"{category}_{key}"] = float(value)
-                        except (ValueError, TypeError):
-                            # Keep as string if not convertible to float
-                            hist_data[f"{category}_{key}"] = value
+        # Create copies of the dataframe for technical indicator calculations
+        df = hist_data.copy()
+        
+        # Calculate RSI (14-period)
+        delta = df['Close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['Oscillators_RSI'] = 100 - (100 / (1 + rs))
+        
+        # Calculate RSI[1] (previous period RSI)
+        df['Oscillators_RSI[1]'] = df['Oscillators_RSI'].shift(1)
+        
+        # Calculate Stochastic Oscillator
+        low_14 = df['Low'].rolling(window=14).min()
+        high_14 = df['High'].rolling(window=14).max()
+        df['Oscillators_STOCH.K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14))
+        df['Oscillators_STOCH.D'] = df['Oscillators_STOCH.K'].rolling(window=3).mean()
+        
+        # Calculate CCI (Commodity Channel Index)
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        moving_avg_20 = typical_price.rolling(window=20).mean()
+        mean_deviation = abs(typical_price - moving_avg_20).rolling(window=20).mean()
+        df['Oscillators_CCI'] = (typical_price - moving_avg_20) / (0.015 * mean_deviation)
+        
+        # Calculate MACD
+        ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['Oscillators_MACD.macd'] = ema_12 - ema_26
+        df['Oscillators_MACD.signal'] = df['Oscillators_MACD.macd'].ewm(span=9, adjust=False).mean()
+        
+        # Calculate Moving Averages
+        # EMA
+        df['Moving Averages_EMA5'] = df['Close'].ewm(span=5, adjust=False).mean()
+        df['Moving Averages_EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['Moving Averages_EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['Moving Averages_EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+        df['Moving Averages_EMA100'] = df['Close'].ewm(span=100, adjust=False).mean()
+        df['Moving Averages_EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        
+        # SMA
+        df['Moving Averages_SMA5'] = df['Close'].rolling(window=5).mean()
+        df['Moving Averages_SMA10'] = df['Close'].rolling(window=10).mean()
+        df['Moving Averages_SMA20'] = df['Close'].rolling(window=20).mean()
+        df['Moving Averages_SMA50'] = df['Close'].rolling(window=50).mean()
+        df['Moving Averages_SMA100'] = df['Close'].rolling(window=100).mean()
+        df['Moving Averages_SMA200'] = df['Close'].rolling(window=200).mean()
+        
+        # Replace NaN values with 'N/A' string
+        df = df.fillna('N/A')
+        
+        # Update the historical data with calculated indicators
+        hist_data = df
         
         # Add some key stock info as columns
         key_info_fields = [
