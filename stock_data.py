@@ -196,7 +196,23 @@ def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NA
     """
     try:
         # Get historical data from Yahoo Finance
-        hist_data = get_yahoo_historical_data(ticker, period, interval)
+        if start_date is not None:
+            # If start_date is provided, use it instead of period
+            stock = yf.Ticker(ticker)
+            
+            # Set end_date to current date if not provided
+            if end_date is None:
+                end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+                
+            # Get historical data using date range
+            hist_data = stock.history(start=start_date, end=end_date, interval=interval)
+            if hist_data.empty:
+                print(f"Error: No data found for {ticker} between {start_date} and {end_date}")
+                return None
+        else:
+            # Use period parameter if start_date is not provided
+            hist_data = get_yahoo_historical_data(ticker, period, interval)
+            
         if hist_data is None:
             print(f"Error: Could not retrieve historical data for {ticker}")
             return None
@@ -270,6 +286,120 @@ def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NA
         print(f"Error collecting and saving data for {ticker}: {e}")
         return None
 
+def collect_and_save_backtest_data(ticker, period="5y", interval="1d", exchange="NASDAQ", screener="america", output_format="csv", start_date=None, end_date=None):
+    """
+    Collect historical stock data for backtesting purposes from Yahoo Finance and TradingView, 
+    then save it to a file with 'backtest' prefix in the 'stockData' folder.
+    
+    Parameters:
+    ticker (str): Stock symbol (e.g., 'AAPL', 'MSFT')
+    period (str): Valid periods: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+                  Default is 5y to provide more historical data for backtesting
+                  Note: This parameter is ignored if start_date is provided
+    interval (str): Valid intervals: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
+    exchange (str): Exchange name (e.g., 'NASDAQ', 'NYSE')
+    screener (str): Screener to use (e.g., 'america', 'japan')
+    output_format (str): Format to save data ('csv' or 'json')
+    start_date (str): Start date for historical data in 'YYYY-MM-DD' format (e.g., '2020-01-01')
+                      If provided, period parameter is ignored
+    end_date (str): End date for historical data in 'YYYY-MM-DD' format (e.g., '2023-12-31')
+                    If not provided and start_date is provided, defaults to current date
+    
+    Returns:
+    str: Path to the created file
+    """
+    try:
+        # Get historical data from Yahoo Finance
+        if start_date is not None:
+            # If start_date is provided, use it instead of period
+            stock = yf.Ticker(ticker)
+            
+            # Set end_date to current date if not provided
+            if end_date is None:
+                end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+                
+            # Get historical data using date range
+            hist_data = stock.history(start=start_date, end=end_date, interval=interval)
+            if hist_data.empty:
+                print(f"Error: No data found for {ticker} between {start_date} and {end_date}")
+                return None
+        else:
+            # Use period parameter if start_date is not provided
+            hist_data = get_yahoo_historical_data(ticker, period, interval)
+            
+        if hist_data is None:
+            print(f"Error: Could not retrieve historical data for {ticker}")
+            return None
+        
+        # Get stock info from Yahoo Finance
+        stock_info = get_yahoo_stock_info(ticker)
+        if stock_info is None:
+            print(f"Error: Could not retrieve stock info for {ticker}")
+            return None
+        
+        # Get technical indicators from TradingView
+        try:
+            tech_indicators = get_tradingview_technical_indicators(ticker, exchange, screener, interval)
+        except Exception as e:
+            print(f"Warning: Could not retrieve TradingView data for {ticker}: {e}")
+            tech_indicators = None
+        
+        # Format the data for prediction algorithms
+        # Add technical indicators as columns to the historical data
+        if tech_indicators is not None:
+            # Extract key technical indicators
+            for category in ['Oscillators', 'Moving Averages']:
+                for key, value in tech_indicators[category].items():
+                    if key not in ['RECOMMENDATION', 'BUY', 'SELL', 'NEUTRAL']:
+                        try:
+                            # Convert to float if possible
+                            hist_data[f"{category}_{key}"] = float(value)
+                        except (ValueError, TypeError):
+                            # Keep as string if not convertible to float
+                            hist_data[f"{category}_{key}"] = value
+        
+        # Add some key stock info as columns
+        key_info_fields = [
+            'sector', 'industry', 'marketCap', 'trailingPE', 'forwardPE',
+            'dividendYield', 'beta', 'fiftyDayAverage', 'twoHundredDayAverage'
+        ]
+        
+        for field in key_info_fields:
+            if field in stock_info:
+                hist_data[f"Info_{field}"] = stock_info[field]
+        
+        # Round numerical values to 3 decimal places for readability
+        for col in hist_data.select_dtypes(include=['float64']).columns:
+            hist_data[col] = hist_data[col].round(3)
+        
+        # Create stockData directory if it doesn't exist
+        stock_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stockData')
+        if not os.path.exists(stock_data_dir):
+            os.makedirs(stock_data_dir)
+            print(f"Created directory: {stock_data_dir}")
+        
+        # Create filename based on ticker with 'backtest' prefix
+        filename = f"backtest{ticker.upper()}_data"
+        
+        # Save to file in the specified format
+        if output_format.lower() == 'csv':
+            file_path = os.path.join(stock_data_dir, f"{filename}.csv")
+            hist_data.to_csv(file_path)
+        else:  # json format
+            file_path = os.path.join(stock_data_dir, f"{filename}.json")
+            # Convert DataFrame to JSON
+            hist_data_json = hist_data.reset_index().to_json(orient='records', date_format='iso')
+            # Save to file
+            with open(file_path, 'w') as f:
+                f.write(hist_data_json)
+        
+        print(f"Backtest data for {ticker} saved to {file_path}")
+        return file_path
+    
+    except Exception as e:
+        print(f"Error collecting and saving backtest data for {ticker}: {e}")
+        return None
+
 # Run if script is executed directly
 if __name__ == "__main__":
     print("Stock Data Retrieval and Processing Module")
@@ -279,3 +409,4 @@ if __name__ == "__main__":
     
     # Example usage:
     # collect_and_save_stock_data('AAPL', period='1y', interval='1d', output_format='csv')
+    # collect_and_save_backtest_data('AAPL', period='5y', interval='1d', output_format='csv')
