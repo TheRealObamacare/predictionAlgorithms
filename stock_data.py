@@ -200,27 +200,72 @@ def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NA
     str: Path to the created file
     """
     try:
-        # Get historical data from Yahoo Finance
+        # Get historical data from Yahoo Finance with extra days for indicator calculation
+        stock = yf.Ticker(ticker)
+        
+        # Determine how many extra data points we need to fetch for accurate indicator calculation
+        # We need at least 200 data points for the longest indicator (SMA200)
+        # Adjust the number of extra days based on the interval
+        base_extra_points = 200
+        
+        # Calculate the extra days needed based on the interval
+        if interval.endswith('m'):  # minutes
+            minutes = int(interval[:-1])
+            # For minute intervals, we need more days to get enough data points
+            # Assuming market is open ~6.5 hours per day (390 minutes)
+            extra_days = (base_extra_points * minutes) // 390 + 30  # Add buffer days
+        elif interval.endswith('h'):  # hours
+            hours = int(interval[:-1])
+            # For hourly intervals, calculate based on ~6.5 trading hours per day
+            extra_days = (base_extra_points * hours) // 6.5 + 15  # Add buffer days
+        elif interval == '1d':  # daily
+            extra_days = base_extra_points
+        elif interval == '1wk':  # weekly
+            extra_days = base_extra_points * 7
+        elif interval == '1mo':  # monthly
+            extra_days = base_extra_points * 30
+        else:  # default
+            extra_days = base_extra_points * 2
+        
         if start_date is not None:
-            # If start_date is provided, use it instead of period
-            stock = yf.Ticker(ticker)
+            # If start_date is provided, adjust it to get extra days for calculation
+            original_start_date = start_date
+            adjusted_start_date = (datetime.datetime.strptime(start_date, '%Y-%m-%d') - 
+                                  datetime.timedelta(days=extra_days)).strftime('%Y-%m-%d')
             
             # Set end_date to current date if not provided
             if end_date is None:
                 end_date = datetime.datetime.now().strftime('%Y-%m-%d')
                 
-            # Get historical data using date range
-            hist_data = stock.history(start=start_date, end=end_date, interval=interval)
+            # Get historical data using adjusted date range
+            hist_data = stock.history(start=adjusted_start_date, end=end_date, interval=interval)
             if hist_data.empty:
-                print(f"Error: No data found for {ticker} between {start_date} and {end_date}")
+                print(f"Error: No data found for {ticker} between {adjusted_start_date} and {end_date}")
                 return None
         else:
             # Use period parameter if start_date is not provided
-            hist_data = get_yahoo_historical_data(ticker, period, interval)
+            # For period-based requests, we'll fetch a longer period and trim later
+            if period.endswith('d'):
+                days = int(period[:-1]) + extra_days
+                adjusted_period = f"{days}d"
+            elif period.endswith('mo'):
+                months = int(period[:-2]) + (extra_days // 30) + 1  # Convert extra days to months
+                adjusted_period = f"{int(months)}mo"
+            elif period.endswith('y'):
+                years = int(period[:-1]) + (extra_days // 365) + 1  # Convert extra days to years
+                adjusted_period = f"{int(years)}y"
+            else:
+                # For other periods like 'max', 'ytd', just add extra time
+                adjusted_period = period
+                
+            hist_data = get_yahoo_historical_data(ticker, adjusted_period, interval)
             
         if hist_data is None:
             print(f"Error: Could not retrieve historical data for {ticker}")
             return None
+            
+        # Store the original date range for later trimming
+        original_start_date = start_date
         
         # Get stock info from Yahoo Finance
         stock_info = get_yahoo_stock_info(ticker)
@@ -282,11 +327,76 @@ def collect_and_save_stock_data(ticker, period="1y", interval="1d", exchange="NA
         df['Moving Averages_SMA100'] = df['Close'].rolling(window=100).mean()
         df['Moving Averages_SMA200'] = df['Close'].rolling(window=200).mean()
         
-        # Replace NaN values with 'N/A' string
-        df = df.fillna('N/A')
-        
         # Update the historical data with calculated indicators
         hist_data = df
+        
+        # Trim the data back to the original requested date range
+        if original_start_date is not None:
+            # If we had a specific start date, trim to that date
+            hist_data = hist_data[hist_data.index >= original_start_date]
+        elif period != adjusted_period:
+            # If we used an adjusted period, trim the extra data points
+            # Calculate the number of data points to keep based on the interval
+            if period.endswith('d'):
+                # For daily data, each data point is one day
+                data_points = int(period[:-1])
+            elif period.endswith('mo'):
+                # For monthly data, approximate based on interval
+                months = int(period[:-2])
+                if interval.endswith('m'):  # minutes
+                    minutes = int(interval[:-1])
+                    # Approximate trading minutes in a month (21 trading days * 6.5 hours * 60 minutes)
+                    data_points = int(months * 21 * 390 // minutes)
+                elif interval.endswith('h'):  # hours
+                    hours = int(interval[:-1])
+                    # Approximate trading hours in a month (21 trading days * 6.5 hours)
+                    data_points = int(months * 21 * 6.5 // hours)
+                elif interval == '1d':
+                    # Approximate trading days in a month
+                    data_points = int(months * 21)
+                elif interval == '1wk':
+                    # Approximate weeks in a month
+                    data_points = int(months * 4)
+                else:  # Default to daily
+                    data_points = int(months * 21)
+            elif period.endswith('y'):
+                # For yearly data, approximate based on interval
+                years = int(period[:-1])
+                if interval.endswith('m'):  # minutes
+                    minutes = int(interval[:-1])
+                    # Approximate trading minutes in a year (252 trading days * 6.5 hours * 60 minutes)
+                    data_points = int(years * 252 * 390 // minutes)
+                elif interval.endswith('h'):  # hours
+                    hours = int(interval[:-1])
+                    # Approximate trading hours in a year (252 trading days * 6.5 hours)
+                    data_points = int(years * 252 * 6.5 // hours)
+                elif interval == '1d':
+                    # Trading days in a year
+                    data_points = int(years * 252)
+                elif interval == '1wk':
+                    # Weeks in a year
+                    data_points = int(years * 52)
+                elif interval == '1mo':
+                    # Months in a year
+                    data_points = int(years * 12)
+                else:  # Default to daily
+                    data_points = int(years * 252)
+            else:
+                # Default to keeping all data
+                data_points = len(hist_data)
+                
+            # Ensure we don't try to keep more data points than we have
+            data_points = min(int(data_points), len(hist_data))
+            
+            # Keep only the requested number of data points
+            if data_points > 0:
+                hist_data = hist_data.iloc[-data_points:]
+        
+        # Remove rows with NaN values in indicator columns
+        hist_data = hist_data.dropna()
+        
+        # Replace any remaining NaN values with 'N/A' string
+        hist_data = hist_data.fillna('N/A')
         
         # Add some key stock info as columns
         key_info_fields = [
@@ -353,27 +463,72 @@ def collect_and_save_backtest_data(ticker, period="5y", interval="1d", exchange=
     str: Path to the created file
     """
     try:
-        # Get historical data from Yahoo Finance
+        # Get historical data from Yahoo Finance with extra days for indicator calculation
+        stock = yf.Ticker(ticker)
+        
+        # Determine how many extra data points we need to fetch for accurate indicator calculation
+        # We need at least 200 data points for the longest indicator (SMA200)
+        # Adjust the number of extra days based on the interval
+        base_extra_points = 200
+        
+        # Calculate the extra days needed based on the interval
+        if interval.endswith('m'):  # minutes
+            minutes = int(interval[:-1])
+            # For minute intervals, we need more days to get enough data points
+            # Assuming market is open ~6.5 hours per day (390 minutes)
+            extra_days = (base_extra_points * minutes) // 390 + 30  # Add buffer days
+        elif interval.endswith('h'):  # hours
+            hours = int(interval[:-1])
+            # For hourly intervals, calculate based on ~6.5 trading hours per day
+            extra_days = (base_extra_points * hours) // 6.5 + 15  # Add buffer days
+        elif interval == '1d':  # daily
+            extra_days = base_extra_points
+        elif interval == '1wk':  # weekly
+            extra_days = base_extra_points * 7
+        elif interval == '1mo':  # monthly
+            extra_days = base_extra_points * 30
+        else:  # default
+            extra_days = base_extra_points * 2
+        
         if start_date is not None:
-            # If start_date is provided, use it instead of period
-            stock = yf.Ticker(ticker)
+            # If start_date is provided, adjust it to get extra days for calculation
+            original_start_date = start_date
+            adjusted_start_date = (datetime.datetime.strptime(start_date, '%Y-%m-%d') - 
+                                  datetime.timedelta(days=extra_days)).strftime('%Y-%m-%d')
             
             # Set end_date to current date if not provided
             if end_date is None:
                 end_date = datetime.datetime.now().strftime('%Y-%m-%d')
                 
-            # Get historical data using date range
-            hist_data = stock.history(start=start_date, end=end_date, interval=interval)
+            # Get historical data using adjusted date range
+            hist_data = stock.history(start=adjusted_start_date, end=end_date, interval=interval)
             if hist_data.empty:
-                print(f"Error: No data found for {ticker} between {start_date} and {end_date}")
+                print(f"Error: No data found for {ticker} between {adjusted_start_date} and {end_date}")
                 return None
         else:
             # Use period parameter if start_date is not provided
-            hist_data = get_yahoo_historical_data(ticker, period, interval)
+            # For period-based requests, we'll fetch a longer period and trim later
+            if period.endswith('d'):
+                days = int(period[:-1]) + extra_days
+                adjusted_period = f"{days}d"
+            elif period.endswith('mo'):
+                months = int(period[:-2]) + (extra_days // 30) + 1  # Convert extra days to months
+                adjusted_period = f"{int(months)}mo"
+            elif period.endswith('y'):
+                years = int(period[:-1]) + (extra_days // 365) + 1  # Convert extra days to years
+                adjusted_period = f"{int(years)}y"
+            else:
+                # For other periods like 'max', 'ytd', just add extra time
+                adjusted_period = period
+                
+            hist_data = get_yahoo_historical_data(ticker, adjusted_period, interval)
             
         if hist_data is None:
             print(f"Error: Could not retrieve historical data for {ticker}")
             return None
+            
+        # Store the original date range for later trimming
+        original_start_date = start_date
         
         # Get stock info from Yahoo Finance
         stock_info = get_yahoo_stock_info(ticker)
@@ -435,11 +590,76 @@ def collect_and_save_backtest_data(ticker, period="5y", interval="1d", exchange=
         df['Moving Averages_SMA100'] = df['Close'].rolling(window=100).mean()
         df['Moving Averages_SMA200'] = df['Close'].rolling(window=200).mean()
         
-        # Replace NaN values with 'N/A' string
-        df = df.fillna('N/A')
-        
         # Update the historical data with calculated indicators
         hist_data = df
+        
+        # Trim the data back to the original requested date range
+        if original_start_date is not None:
+            # If we had a specific start date, trim to that date
+            hist_data = hist_data[hist_data.index >= original_start_date]
+        elif period != adjusted_period:
+            # If we used an adjusted period, trim the extra data points
+            # Calculate the number of data points to keep based on the interval
+            if period.endswith('d'):
+                # For daily data, each data point is one day
+                data_points = int(period[:-1])
+            elif period.endswith('mo'):
+                # For monthly data, approximate based on interval
+                months = int(period[:-2])
+                if interval.endswith('m'):  # minutes
+                    minutes = int(interval[:-1])
+                    # Approximate trading minutes in a month (21 trading days * 6.5 hours * 60 minutes)
+                    data_points = int(months * 21 * 390 // minutes)
+                elif interval.endswith('h'):  # hours
+                    hours = int(interval[:-1])
+                    # Approximate trading hours in a month (21 trading days * 6.5 hours)
+                    data_points = int(months * 21 * 6.5 // hours)
+                elif interval == '1d':
+                    # Approximate trading days in a month
+                    data_points = int(months * 21)
+                elif interval == '1wk':
+                    # Approximate weeks in a month
+                    data_points = int(months * 4)
+                else:  # Default to daily
+                    data_points = int(months * 21)
+            elif period.endswith('y'):
+                # For yearly data, approximate based on interval
+                years = int(period[:-1])
+                if interval.endswith('m'):  # minutes
+                    minutes = int(interval[:-1])
+                    # Approximate trading minutes in a year (252 trading days * 6.5 hours * 60 minutes)
+                    data_points = int(years * 252 * 390 // minutes)
+                elif interval.endswith('h'):  # hours
+                    hours = int(interval[:-1])
+                    # Approximate trading hours in a year (252 trading days * 6.5 hours)
+                    data_points = int(years * 252 * 6.5 // hours)
+                elif interval == '1d':
+                    # Trading days in a year
+                    data_points = int(years * 252)
+                elif interval == '1wk':
+                    # Weeks in a year
+                    data_points = int(years * 52)
+                elif interval == '1mo':
+                    # Months in a year
+                    data_points = int(years * 12)
+                else:  # Default to daily
+                    data_points = int(years * 252)
+            else:
+                # Default to keeping all data
+                data_points = len(hist_data)
+                
+            # Ensure we don't try to keep more data points than we have
+            data_points = min(int(data_points), len(hist_data))
+            
+            # Keep only the requested number of data points
+            if data_points > 0:
+                hist_data = hist_data.iloc[-data_points:]
+        
+        # Remove rows with NaN values in indicator columns
+        hist_data = hist_data.dropna()
+        
+        # Replace any remaining NaN values with 'N/A' string
+        hist_data = hist_data.fillna('N/A')
         
         # Add some key stock info as columns
         key_info_fields = [
