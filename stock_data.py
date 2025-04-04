@@ -28,6 +28,41 @@ def get_yahoo_historical_data(ticker, period="1y", interval="1d"):
     except Exception as e:
         print(f"Error fetching Yahoo Finance historical data: {e}")
         return None
+        
+def get_yahoo_dividend_data(ticker, start_date=None, end_date=None):
+    """
+    Fetch dividend data for a stock from Yahoo Finance
+    
+    Parameters:
+    ticker (str): Stock symbol (e.g., 'AAPL', 'MSFT')
+    start_date (str): Start date in 'YYYY-MM-DD' format
+    end_date (str): End date in 'YYYY-MM-DD' format
+    
+    Returns:
+    pandas.DataFrame: Dividend data with dates and amounts
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        
+        # If dates are provided, use them; otherwise, get all available dividend data
+        if start_date and end_date:
+            dividends = stock.dividends.loc[start_date:end_date]
+        else:
+            dividends = stock.dividends
+            
+        if len(dividends) > 0:
+            # Convert Series to DataFrame with proper column name
+            dividends_df = dividends.to_frame().reset_index()
+            dividends_df.columns = ['Date', 'Dividend']
+            dividends_df['Date'] = pd.to_datetime(dividends_df['Date'])
+            dividends_df = dividends_df.set_index('Date')
+            return dividends_df
+        else:
+            print(f"No dividend data found for {ticker}")
+            return pd.DataFrame(columns=['Dividend'])
+    except Exception as e:
+        print(f"Error fetching Yahoo Finance dividend data: {e}")
+        return pd.DataFrame(columns=['Dividend'])
 
 def get_yahoo_stock_info(ticker):
     """
