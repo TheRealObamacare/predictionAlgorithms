@@ -35,8 +35,24 @@ else:
 
 print(f"PyTorch device: {device}")
 
-# Force CUDA tensor operations to synchronize for accurate timing
-torch.cuda.synchronize() if torch.cuda.is_available() else None
+# Setup CUDA synchronization with proper error handling
+if torch.cuda.is_available():
+    try:
+        # Try to synchronize CUDA operations
+        torch.cuda.synchronize()
+        print("CUDA synchronization successful")
+    except RuntimeError as e:
+        # Handle CUDA synchronization errors
+        print(f"CUDA synchronization error: {e}")
+        print("Falling back to CPU for this session")
+        device = torch.device("cpu")
+        print(f"Device switched to: {device}")
+        
+        # Provide troubleshooting advice
+        print("\nTroubleshooting tips:")
+        print("1. Close other GPU-intensive applications")
+        print("2. Restart your Python environment")
+        print("3. Try setting environment variable: CUDA_LAUNCH_BLOCKING=1")
 
 def load_stock_data(file_path):
     """
@@ -49,9 +65,24 @@ def load_stock_data(file_path):
     pandas.DataFrame: Stock data
     """
     try:
-        data = pd.read_csv(file_path, index_col='Datetime', parse_dates=True)
-        print(f"Loaded data with shape: {data.shape}")
-        return data
+        # First check the CSV file structure to determine the correct datetime column
+        df_peek = pd.read_csv(file_path, nrows=1)
+        
+        # Check if 'Date' or 'Datetime' column exists
+        datetime_col = None
+        if 'Datetime' in df_peek.columns:
+            datetime_col = 'Datetime'
+        elif 'Date' in df_peek.columns:
+            datetime_col = 'Date'
+        
+        # If datetime column found, set it as index
+        if datetime_col:
+            data = pd.read_csv(file_path, index_col=datetime_col, parse_dates=True)
+            print(f"Loaded data with shape: {data.shape}")
+            return data
+        else:
+            print(f"Error: No datetime column found in {file_path}")
+            return None
     except Exception as e:
         print(f"Error loading stock data: {e}")
         return None
@@ -109,9 +140,22 @@ def prepare_data_for_lstm(data, target_col='Close', feature_cols=None, sequence_
             # Convert date_split to datetime
             split_date = pd.to_datetime(date_split)
             
-            # Create masks for train and test sets based on date
-            train_mask = [date < split_date for date in dates]
-            test_mask = [date >= split_date for date in dates]
+            # Normalize dates for comparison
+            normalized_dates = []
+            for date in dates:
+                # Convert timezone-aware timestamps to timezone-naive
+                if hasattr(date, 'tzinfo') and date.tzinfo is not None:
+                    normalized_dates.append(date.replace(tzinfo=None))
+                else:
+                    normalized_dates.append(date)
+            
+            # Ensure split_date is timezone-naive
+            if hasattr(split_date, 'tzinfo') and split_date.tzinfo is not None:
+                split_date = split_date.replace(tzinfo=None)
+            
+            # Create masks for train and test sets based on normalized dates
+            train_mask = [date < split_date for date in normalized_dates]
+            test_mask = [date >= split_date for date in normalized_dates]
             
             # Split data based on date
             X_train = X[train_mask]
@@ -364,9 +408,13 @@ def train_model(model, X_train, y_train, epochs=50, batch_size=32, validation_sp
     # Load best model
     model.load_state_dict(best_model)
     
-    # Synchronize CUDA operations if using GPU
+    # Synchronize CUDA operations if using GPU with error handling
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            print(f"CUDA synchronization error during training: {e}")
+            print("Training completed, but CUDA synchronization failed")
     
     return model, history
 
@@ -395,9 +443,13 @@ def evaluate_model(model, X_test, y_test, scaler, cols, target_idx):
     # Make predictions
     model.eval()
     with torch.no_grad():
-        # Synchronize before prediction if using GPU
+        # Synchronize before prediction if using GPU with error handling
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                print(f"CUDA synchronization error during evaluation: {e}")
+                print("Continuing with evaluation without synchronization")
             
         # Make predictions and move to CPU for numpy conversion
         y_pred_scaled = model(X_test).cpu().numpy()
@@ -463,9 +515,12 @@ def plot_predictions(y_true, y_pred, title="Model Predictions vs Actual"):
     plt.savefig(os.path.join(plots_dir, f"{title.replace(' ', '_')}_{timestamp}.png"))
     plt.show()
 
-def backtest_strategy(data, predictions, initial_investment=10000, commission=0.001, ticker=None):
+def backtest_strategy(data, predictions, initial_investment=10000, commission=0.001, ticker=None, 
+                     use_adaptive_risk=True, max_position_size=1.0, min_position_size=0.1, 
+                     base_stop_loss=0.02, base_take_profit=0.04, volatility_window=20, 
+                     min_risk_reward_ratio=1.5, max_portfolio_heat=0.8):
     """
-    Backtest a trading strategy based on model predictions
+    Backtest a trading strategy based on model predictions with adaptive risk management
     
     Parameters:
     data (pandas.DataFrame): Original stock data
@@ -473,6 +528,14 @@ def backtest_strategy(data, predictions, initial_investment=10000, commission=0.
     initial_investment (float): Initial investment amount (default: 10000)
     commission (float): Commission rate per trade (default: 0.001)
     ticker (str): Stock ticker symbol for fetching dividend data (default: None)
+    use_adaptive_risk (bool): Whether to use adaptive risk management (default: True)
+    max_position_size (float): Maximum position size as a fraction of portfolio (default: 1.0)
+    min_position_size (float): Minimum position size as a fraction of portfolio (default: 0.1)
+    base_stop_loss (float): Base stop-loss percentage (default: 0.02 or 2%)
+    base_take_profit (float): Base take-profit percentage (default: 0.04 or 4%)
+    volatility_window (int): Window size for calculating volatility (default: 20)
+    min_risk_reward_ratio (float): Minimum risk-reward ratio for taking a trade (default: 1.5)
+    max_portfolio_heat (float): Maximum portfolio heat/exposure allowed (default: 0.8 or 80%)
     
     Returns:
     pandas.DataFrame: Backtest results
@@ -487,13 +550,71 @@ def backtest_strategy(data, predictions, initial_investment=10000, commission=0.
     backtest_data['Actual_Return'] = backtest_data['Close'].pct_change()
     backtest_data['Predicted_Return'] = backtest_data['Predicted_Close'].pct_change()
     
-    # Generate trading signals (1 for buy, -1 for sell, 0 for hold)
-    backtest_data['Signal'] = 0
-    backtest_data.loc[backtest_data['Predicted_Return'] > 0, 'Signal'] = 1  # Buy signal
-    backtest_data.loc[backtest_data['Predicted_Return'] < 0, 'Signal'] = -1  # Sell signal
-    
-    # Calculate strategy returns
-    backtest_data['Strategy_Return'] = backtest_data['Signal'].shift(1) * backtest_data['Actual_Return']
+    if use_adaptive_risk:
+        # Calculate prediction confidence (magnitude of predicted return)
+        backtest_data['Prediction_Confidence'] = backtest_data['Predicted_Return'].abs()
+        
+        # Calculate historical volatility using rolling standard deviation
+        backtest_data['Volatility'] = backtest_data['Actual_Return'].rolling(window=volatility_window).std()
+        
+        # Fill NaN values with the mean to handle the initial window period
+        backtest_data['Volatility'] = backtest_data['Volatility'].fillna(backtest_data['Volatility'].mean())
+        
+        # Normalize confidence to range [0, 1] using min-max scaling
+        if len(backtest_data) > 1:
+            min_conf = backtest_data['Prediction_Confidence'].min()
+            max_conf = backtest_data['Prediction_Confidence'].max()
+            if max_conf > min_conf:  # Avoid division by zero
+                backtest_data['Normalized_Confidence'] = (backtest_data['Prediction_Confidence'] - min_conf) / (max_conf - min_conf)
+            else:
+                backtest_data['Normalized_Confidence'] = 0.5  # Default if all values are the same
+        else:
+            backtest_data['Normalized_Confidence'] = 0.5  # Default for single data point
+        
+        # Calculate adaptive position size based on prediction confidence
+        backtest_data['Position_Size'] = min_position_size + (max_position_size - min_position_size) * backtest_data['Normalized_Confidence']
+        
+        # Calculate dynamic stop-loss and take-profit levels based on volatility
+        backtest_data['Stop_Loss'] = base_stop_loss * (1 + backtest_data['Volatility'] / backtest_data['Volatility'].mean())
+        backtest_data['Take_Profit'] = base_take_profit * (1 + backtest_data['Volatility'] / backtest_data['Volatility'].mean())
+        
+        # Calculate risk-reward ratio
+        backtest_data['Risk_Reward_Ratio'] = backtest_data['Take_Profit'] / backtest_data['Stop_Loss']
+        
+        # Generate trading signals with risk management
+        backtest_data['Signal'] = 0
+        
+        # Only take trades with favorable risk-reward ratio
+        favorable_risk_reward = backtest_data['Risk_Reward_Ratio'] >= min_risk_reward_ratio
+        
+        # Buy signal when predicted return is positive and risk-reward is favorable
+        backtest_data.loc[(backtest_data['Predicted_Return'] > 0) & favorable_risk_reward, 'Signal'] = 1
+        
+        # Sell signal when predicted return is negative and risk-reward is favorable
+        backtest_data.loc[(backtest_data['Predicted_Return'] < 0) & favorable_risk_reward, 'Signal'] = -1
+        
+        # Calculate portfolio heat (exposure)
+        backtest_data['Portfolio_Heat'] = backtest_data['Position_Size'] * backtest_data['Signal'].abs()
+        
+        # Apply portfolio heat limit
+        backtest_data.loc[backtest_data['Portfolio_Heat'] > max_portfolio_heat, 'Position_Size'] = (
+            max_portfolio_heat / backtest_data.loc[backtest_data['Portfolio_Heat'] > max_portfolio_heat, 'Signal'].abs()
+        )
+        
+        # Recalculate portfolio heat after adjustment
+        backtest_data['Portfolio_Heat'] = backtest_data['Position_Size'] * backtest_data['Signal'].abs()
+        
+        # Calculate strategy returns with position sizing
+        backtest_data['Strategy_Return'] = backtest_data['Signal'].shift(1) * backtest_data['Position_Size'].shift(1) * backtest_data['Actual_Return']
+    else:
+        # Traditional approach without adaptive risk management
+        # Generate trading signals (1 for buy, -1 for sell, 0 for hold)
+        backtest_data['Signal'] = 0
+        backtest_data.loc[backtest_data['Predicted_Return'] > 0, 'Signal'] = 1  # Buy signal
+        backtest_data.loc[backtest_data['Predicted_Return'] < 0, 'Signal'] = -1  # Sell signal
+        
+        # Calculate strategy returns
+        backtest_data['Strategy_Return'] = backtest_data['Signal'].shift(1) * backtest_data['Actual_Return']
     
     # Account for commission costs on trades
     backtest_data['Trade'] = backtest_data['Signal'].diff().abs()
@@ -586,27 +707,85 @@ def plot_backtest_results(backtest_data, title="Trading Strategy Backtest Result
     backtest_data (pandas.DataFrame): Backtest results
     title (str): Plot title (default: "Trading Strategy Backtest Results")
     """
-    plt.figure(figsize=(12, 10))
+    # Check if adaptive risk management was used
+    has_adaptive_risk = 'Position_Size' in backtest_data.columns
     
-    # Plot 1: Portfolio Values
-    plt.subplot(2, 1, 1)
-    plt.plot(backtest_data['Buy_Hold_Value'], label='Buy & Hold')
-    plt.plot(backtest_data['Strategy_Value'], label='Strategy')
-    plt.title('Portfolio Value Comparison')
-    plt.xlabel('Date')
-    plt.ylabel('Portfolio Value ($)')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot 2: Cumulative Returns
-    plt.subplot(2, 1, 2)
-    plt.plot(backtest_data['Cumulative_Actual_Return'], label='Buy & Hold')
-    plt.plot(backtest_data['Cumulative_Strategy_Return'], label='Strategy')
-    plt.title('Cumulative Returns')
-    plt.xlabel('Date')
-    plt.ylabel('Cumulative Return')
-    plt.legend()
-    plt.grid(True)
+    if has_adaptive_risk:
+        # Create a figure with 4 subplots for adaptive risk management
+        plt.figure(figsize=(15, 15))
+        
+        # Plot 1: Portfolio Values
+        plt.subplot(3, 1, 1)
+        plt.plot(backtest_data['Buy_Hold_Value'], label='Buy & Hold')
+        plt.plot(backtest_data['Strategy_Value'], label='Adaptive Strategy')
+        plt.title('Portfolio Value Comparison')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value ($)')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot 2: Cumulative Returns
+        plt.subplot(3, 1, 2)
+        plt.plot(backtest_data['Cumulative_Actual_Return'], label='Buy & Hold')
+        plt.plot(backtest_data['Cumulative_Strategy_Return'], label='Adaptive Strategy')
+        plt.title('Cumulative Returns')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Return')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot 3: Risk Management Metrics
+        plt.subplot(3, 1, 3)
+        
+        # Create a twin axis for position size
+        ax1 = plt.gca()
+        ax2 = ax1.twinx()
+        
+        # Plot volatility and position size
+        ax1.plot(backtest_data['Volatility'], 'r-', label='Volatility', alpha=0.7)
+        ax1.set_ylabel('Volatility', color='r')
+        ax1.tick_params(axis='y', labelcolor='r')
+        
+        ax2.plot(backtest_data['Position_Size'], 'b-', label='Position Size', alpha=0.7)
+        ax2.set_ylabel('Position Size', color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+        
+        # Add portfolio heat as a filled area
+        ax2.fill_between(backtest_data.index, 0, backtest_data['Portfolio_Heat'], 
+                         color='g', alpha=0.3, label='Portfolio Heat')
+        
+        plt.title('Adaptive Risk Management Metrics')
+        plt.xlabel('Date')
+        
+        # Create a combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        
+        plt.grid(True)
+    else:
+        # Original 2-subplot figure for traditional strategy
+        plt.figure(figsize=(12, 10))
+        
+        # Plot 1: Portfolio Values
+        plt.subplot(2, 1, 1)
+        plt.plot(backtest_data['Buy_Hold_Value'], label='Buy & Hold')
+        plt.plot(backtest_data['Strategy_Value'], label='Strategy')
+        plt.title('Portfolio Value Comparison')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value ($)')
+        plt.legend()
+        plt.grid(True)
+        
+        # Plot 2: Cumulative Returns
+        plt.subplot(2, 1, 2)
+        plt.plot(backtest_data['Cumulative_Actual_Return'], label='Buy & Hold')
+        plt.plot(backtest_data['Cumulative_Strategy_Return'], label='Strategy')
+        plt.title('Cumulative Returns')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Return')
+        plt.legend()
+        plt.grid(True)
     
     plt.tight_layout()
     
@@ -619,10 +798,223 @@ def plot_backtest_results(backtest_data, title="Trading Strategy Backtest Result
     plt.savefig(os.path.join(plots_dir, f"{title.replace(' ', '_')}_{timestamp}.png"))
     plt.show()
 
-def run_lstm_prediction(ticker=None, data_file=None, feature_cols=None, sequence_length=60, train_split=0.8, 
-                       lstm_units=50, dropout_rate=0.2, epochs=50, batch_size=32, date_split=None):
+def validate_ticker_symbol(ticker):
     """
-    Run the complete LSTM prediction workflow
+    Validate a ticker symbol and provide suggestions for common mistakes
+    
+    Parameters:
+    ticker (str): Stock ticker symbol to validate
+    
+    Returns:
+    tuple: (is_valid, suggestion)
+    """
+    import yfinance as yf
+    
+    # Common ticker symbol mistakes and their corrections
+    common_mistakes = {
+        'TSMC': 'TSM',  # Taiwan Semiconductor Manufacturing Company
+        'GOOGLE': 'GOOGL',  # Alphabet Inc. (Google)
+        'ALPHABET': 'GOOGL',  # Alphabet Inc.
+        'FACEBOOK': 'META',  # Meta Platforms (formerly Facebook)
+        'FB': 'META',  # Meta Platforms (formerly Facebook)
+        'TESLA': 'TSLA',  # Tesla Inc.
+        'AMAZON': 'AMZN',  # Amazon.com Inc.
+        'MICROSOFT': 'MSFT',  # Microsoft Corporation
+        'APPLE': 'AAPL',  # Apple Inc.
+        'NETFLIX': 'NFLX',  # Netflix Inc.
+        'BERKSHIRE': 'BRK-B',  # Berkshire Hathaway Inc.
+        'COCA COLA': 'KO',  # The Coca-Cola Company
+        'COCA-COLA': 'KO',  # The Coca-Cola Company
+        'MCDONALDS': 'MCD',  # McDonald's Corporation
+        'MCDONALD': 'MCD',  # McDonald's Corporation
+        'DISNEY': 'DIS',  # The Walt Disney Company
+        'NVIDIA': 'NVDA',  # NVIDIA Corporation
+        'INTEL': 'INTC',  # Intel Corporation
+        'AMD': 'AMD',  # Advanced Micro Devices, Inc.
+        'IBM': 'IBM',  # International Business Machines Corporation
+        'ORACLE': 'ORCL',  # Oracle Corporation
+        'CISCO': 'CSCO',  # Cisco Systems, Inc.
+        'SALESFORCE': 'CRM',  # Salesforce, Inc.
+        'NIKE': 'NKE',  # NIKE, Inc.
+        'ADIDAS': 'ADDYY',  # Adidas AG
+        'VOLKSWAGEN': 'VWAGY',  # Volkswagen AG
+        'TOYOTA': 'TM',  # Toyota Motor Corporation
+        'HONDA': 'HMC',  # Honda Motor Co., Ltd.
+        'FORD': 'F',  # Ford Motor Company
+        'GM': 'GM',  # General Motors Company
+        'GENERAL MOTORS': 'GM',  # General Motors Company
+        'EXXON': 'XOM',  # Exxon Mobil Corporation
+        'EXXONMOBIL': 'XOM',  # Exxon Mobil Corporation
+        'CHEVRON': 'CVX',  # Chevron Corporation
+        'BP': 'BP',  # BP p.l.c.
+        'SHELL': 'SHEL',  # Shell plc
+        'ROYAL DUTCH SHELL': 'SHEL',  # Shell plc
+        'PFIZER': 'PFE',  # Pfizer Inc.
+        'JOHNSON': 'JNJ',  # Johnson & Johnson
+        'JOHNSON & JOHNSON': 'JNJ',  # Johnson & Johnson
+        'MERCK': 'MRK',  # Merck & Co., Inc.
+        'NOVARTIS': 'NVS',  # Novartis AG
+        'ROCHE': 'RHHBY',  # Roche Holding AG
+        'ASTRAZENECA': 'AZN',  # AstraZeneca PLC
+        'MODERNA': 'MRNA',  # Moderna, Inc.
+        'BIONTECH': 'BNTX',  # BioNTech SE
+        'BANK OF AMERICA': 'BAC',  # Bank of America Corporation
+        'JPMORGAN': 'JPM',  # JPMorgan Chase & Co.
+        'JP MORGAN': 'JPM',  # JPMorgan Chase & Co.
+        'GOLDMAN SACHS': 'GS',  # The Goldman Sachs Group, Inc.
+        'MORGAN STANLEY': 'MS',  # Morgan Stanley
+        'WELLS FARGO': 'WFC',  # Wells Fargo & Company
+        'CITIGROUP': 'C',  # Citigroup Inc.
+        'CITI': 'C',  # Citigroup Inc.
+        'HSBC': 'HSBC',  # HSBC Holdings plc
+        'BARCLAYS': 'BCS',  # Barclays PLC
+        'UBS': 'UBS',  # UBS Group AG
+        'CREDIT SUISSE': 'CS',  # Credit Suisse Group AG
+        'DEUTSCHE BANK': 'DB',  # Deutsche Bank Aktiengesellschaft
+        'PAYPAL': 'PYPL',  # PayPal Holdings, Inc.
+        'VISA': 'V',  # Visa Inc.
+        'MASTERCARD': 'MA',  # Mastercard Incorporated
+        'AMERICAN EXPRESS': 'AXP',  # American Express Company
+        'AMEX': 'AXP',  # American Express Company
+        'SQUARE': 'SQ',  # Block, Inc. (formerly Square)
+        'BLOCK': 'SQ',  # Block, Inc.
+        'ROBINHOOD': 'HOOD',  # Robinhood Markets, Inc.
+        'COINBASE': 'COIN',  # Coinbase Global, Inc.
+        'BITCOIN': 'BTC-USD',  # Bitcoin USD
+        'ETHEREUM': 'ETH-USD',  # Ethereum USD
+        'DOW JONES': '^DJI',  # Dow Jones Industrial Average
+        'DOW': '^DJI',  # Dow Jones Industrial Average
+        'S&P 500': '^GSPC',  # S&P 500
+        'S&P': '^GSPC',  # S&P 500
+        'NASDAQ': '^IXIC',  # NASDAQ Composite
+        'RUSSELL 2000': '^RUT',  # Russell 2000
+        'VIX': '^VIX',  # CBOE Volatility Index
+        'NIKKEI': '^N225',  # Nikkei 225
+        'FTSE': '^FTSE',  # FTSE 100
+        'DAX': '^GDAXI',  # DAX PERFORMANCE-INDEX
+        'CAC 40': '^FCHI',  # CAC 40
+        'HANG SENG': '^HSI',  # HANG SENG INDEX
+        'SSE': '^SSEC',  # SSE Composite Index
+        'SENSEX': '^BSESN',  # S&P BSE SENSEX
+        'NIFTY 50': '^NSEI',  # NIFTY 50
+        'ASX 200': '^AXJO',  # S&P/ASX 200
+    }
+    
+    # Check if the ticker is in the common mistakes dictionary
+    if ticker.upper() in common_mistakes:
+        suggestion = common_mistakes[ticker.upper()]
+        return False, suggestion
+    
+    # Try to get info for the ticker to validate it
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Check if we got valid info back
+        if 'symbol' in info and info['symbol'] == ticker.upper():
+            return True, None
+        else:
+            # Try to get a suggestion
+            for correct_ticker, info in common_mistakes.items():
+                if ticker.upper() in correct_ticker or correct_ticker in ticker.upper():
+                    return False, info
+            return False, None
+    except Exception as e:
+        # If there was an error, the ticker might not be valid
+        # Try to get a suggestion
+        for correct_ticker, info in common_mistakes.items():
+            if ticker.upper() in correct_ticker or correct_ticker in ticker.upper():
+                return False, info
+        return False, None
+
+def get_backtest_data(ticker, use_backtest=True, date_split=None, force_refresh=True):
+    """
+    Get backtest data for a ticker, checking for existing backtest data first.
+    If backtest data is missing or force_refresh is True, it will use collect_and_save_stock_data.
+    
+    Parameters:
+    ticker (str): Stock ticker symbol (e.g., 'AAPL', 'MSFT')
+    use_backtest (bool): Whether to try using backtest data first (default: True)
+    date_split (str): Date to split training and testing data (format: 'YYYY-MM-DD')
+                      If None, will use 1 year ago as the split date
+    force_refresh (bool): Whether to force refresh data even if it exists (default: True)
+    
+    Returns:
+    tuple: (data_file, date_split)
+    """
+    import os
+    import datetime
+    from stock_data import collect_and_save_backtest_data, collect_and_save_stock_data
+    
+    # Validate the ticker symbol
+    is_valid, suggestion = validate_ticker_symbol(ticker)
+    if not is_valid and suggestion is not None:
+        print(f"Warning: '{ticker}' may not be a valid ticker symbol.")
+        print(f"Did you mean '{suggestion}'? Using '{suggestion}' instead.")
+        ticker = suggestion
+    elif not is_valid:
+        print(f"Warning: '{ticker}' may not be a valid ticker symbol. Proceeding anyway, but data retrieval may fail.")
+    
+    # If date_split is not provided, use 1 year ago as the default split date
+    if date_split is None:
+        # Calculate date 1 year ago from today
+        today = datetime.datetime.now()
+        one_year_ago = (today - datetime.timedelta(days=365)).strftime('%Y-%m-%d')
+        date_split = one_year_ago
+        print(f"Using default date split: {date_split} (1 year ago)")
+    
+    # Check if backtest data exists
+    stock_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stockData')
+    backtest_file = os.path.join(stock_data_dir, f"backtest{ticker.upper()}_data.csv")
+    
+    # Use existing data only if force_refresh is False and the file exists
+    if use_backtest and os.path.exists(backtest_file) and not force_refresh:
+        print(f"Using existing backtest data for {ticker} from {backtest_file}")
+        return backtest_file, date_split
+        
+    # If force_refresh is True or file doesn't exist, collect fresh data
+    if force_refresh and os.path.exists(backtest_file):
+        print(f"Force refresh enabled: Collecting fresh data for {ticker}")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"Data refresh timestamp: {timestamp}")
+    
+    # If backtest data doesn't exist or we're not using it, try to get it
+    if use_backtest:
+        print(f"Backtest data not found for {ticker}, collecting it now...")
+        # Get training data from backtest function (historical data)
+        backtest_file = collect_and_save_backtest_data(
+            ticker,
+            interval="1d",
+            output_format="csv",
+            end_date=date_split  # Use date_split as the end date for training data
+        )
+        
+        if backtest_file is not None:
+            print(f"Successfully collected backtest data for {ticker}")
+            return backtest_file, date_split
+    
+    # If we couldn't get backtest data or we're not using it, use regular stock data
+    print(f"Using regular stock data collection for {ticker}")
+    data_file = collect_and_save_stock_data(
+        ticker,
+        period="max",  # Get maximum available history
+        interval="1d",  # Daily data
+        output_format="csv"
+    )
+    
+    if data_file is None:
+        print(f"Error: Failed to fetch data for {ticker}")
+        return None, date_split
+    
+    return data_file, date_split
+
+def run_lstm_prediction(ticker=None, data_file=None, feature_cols=None, sequence_length=60, train_split=0.8, 
+                       lstm_units=50, dropout_rate=0.2, epochs=50, batch_size=32, date_split=None, force_refresh=True,
+                       use_adaptive_risk=True, max_position_size=1.0, min_position_size=0.1, 
+                       base_stop_loss=0.02, base_take_profit=0.04, volatility_window=20, 
+                       min_risk_reward_ratio=1.5, max_portfolio_heat=0.8):
+    """
+    Run the complete LSTM prediction workflow with adaptive risk management
     
     Parameters:
     ticker (str): Stock ticker symbol (e.g., 'AAPL', 'MSFT'). If provided, data will be fetched for this ticker.
@@ -636,33 +1028,23 @@ def run_lstm_prediction(ticker=None, data_file=None, feature_cols=None, sequence
     batch_size (int): Batch size (default: 32)
     date_split (str): Date to split training and testing data (format: 'YYYY-MM-DD')
                       If None and ticker is provided, will use 1 year ago as the split date
+    force_refresh (bool): Whether to force refresh data even if it exists (default: True)
+    use_adaptive_risk (bool): Whether to use adaptive risk management (default: True)
+    max_position_size (float): Maximum position size as a fraction of portfolio (default: 1.0)
+    min_position_size (float): Minimum position size as a fraction of portfolio (default: 0.1)
+    base_stop_loss (float): Base stop-loss percentage (default: 0.02 or 2%)
+    base_take_profit (float): Base take-profit percentage (default: 0.04 or 4%)
+    volatility_window (int): Window size for calculating volatility (default: 20)
+    min_risk_reward_ratio (float): Minimum risk-reward ratio for taking a trade (default: 1.5)
+    max_portfolio_heat (float): Maximum portfolio heat/exposure allowed (default: 0.8 or 80%)
     
     Returns:
     tuple: (model, backtest_data)
     """
     # Load or fetch data
     if ticker is not None:
-        # Import the stock_data module
-        from stock_data import collect_and_save_stock_data
-        import datetime
-        
-        print(f"\nFetching data for ticker: {ticker}")
-        
-        # If date_split is not provided, use 1 year ago as the default split date
-        if date_split is None:
-            # Calculate date 1 year ago from today
-            today = datetime.datetime.now()
-            one_year_ago = (today - datetime.timedelta(days=365)).strftime('%Y-%m-%d')
-            date_split = one_year_ago
-            print(f"Using default date split: {date_split} (1 year ago)")
-        
-        # Fetch all historical data
-        data_file = collect_and_save_stock_data(
-            ticker, 
-            period="max",  # Get maximum available history
-            interval="1d",  # Daily data
-            output_format="csv"
-        )
+        # Get backtest data or regular stock data if backtest is missing
+        data_file, date_split = get_backtest_data(ticker, use_backtest=True, date_split=date_split, force_refresh=force_refresh)
         
         if data_file is None:
             print(f"Error: Failed to fetch data for {ticker}")
@@ -694,8 +1076,18 @@ def run_lstm_prediction(ticker=None, data_file=None, feature_cols=None, sequence
     title = f"{ticker} LSTM Model Predictions vs Actual" if ticker else "LSTM Model Predictions vs Actual"
     plot_predictions(y_true, y_pred, title=title)
     
-    # Backtest strategy
-    backtest_data = backtest_strategy(data, y_pred)
+    # Backtest strategy with adaptive risk management
+    backtest_data = backtest_strategy(
+        data, y_pred, 
+        use_adaptive_risk=use_adaptive_risk,
+        max_position_size=max_position_size,
+        min_position_size=min_position_size,
+        base_stop_loss=base_stop_loss,
+        base_take_profit=base_take_profit,
+        volatility_window=volatility_window,
+        min_risk_reward_ratio=min_risk_reward_ratio,
+        max_portfolio_heat=max_portfolio_heat
+    )
     
     # Plot backtest results
     title = f"{ticker} LSTM Trading Strategy Backtest Results" if ticker else "LSTM Trading Strategy Backtest Results"
@@ -704,9 +1096,12 @@ def run_lstm_prediction(ticker=None, data_file=None, feature_cols=None, sequence
     return model, backtest_data
 
 def run_nn_prediction(ticker=None, data_file=None, feature_cols=None, sequence_length=60, train_split=0.8, 
-                     layers=[64, 32], dropout_rate=0.2, epochs=50, batch_size=32, date_split=None):
+                     layers=[64, 32], dropout_rate=0.2, epochs=50, batch_size=32, date_split=None, force_refresh=True,
+                     use_adaptive_risk=True, max_position_size=1.0, min_position_size=0.1, 
+                     base_stop_loss=0.02, base_take_profit=0.04, volatility_window=20, 
+                     min_risk_reward_ratio=1.5, max_portfolio_heat=0.8):
     """
-    Run the complete Neural Network prediction workflow
+    Run the complete Neural Network prediction workflow with adaptive risk management
     
     Parameters:
     ticker (str): Stock ticker symbol (e.g., 'AAPL', 'MSFT'). If provided, data will be fetched for this ticker.
@@ -720,33 +1115,23 @@ def run_nn_prediction(ticker=None, data_file=None, feature_cols=None, sequence_l
     batch_size (int): Batch size (default: 32)
     date_split (str): Date to split training and testing data (format: 'YYYY-MM-DD')
                        If None and ticker is provided, will use 1 year ago as the split date
+    force_refresh (bool): Whether to force refresh data even if it exists (default: True)
+    use_adaptive_risk (bool): Whether to use adaptive risk management (default: True)
+    max_position_size (float): Maximum position size as a fraction of portfolio (default: 1.0)
+    min_position_size (float): Minimum position size as a fraction of portfolio (default: 0.1)
+    base_stop_loss (float): Base stop-loss percentage (default: 0.02 or 2%)
+    base_take_profit (float): Base take-profit percentage (default: 0.04 or 4%)
+    volatility_window (int): Window size for calculating volatility (default: 20)
+    min_risk_reward_ratio (float): Minimum risk-reward ratio for taking a trade (default: 1.5)
+    max_portfolio_heat (float): Maximum portfolio heat/exposure allowed (default: 0.8 or 80%)
     
     Returns:
     tuple: (model, backtest_data)
     """
     # Load or fetch data
     if ticker is not None:
-        # Import the stock_data module
-        from stock_data import collect_and_save_stock_data
-        import datetime
-        
-        print(f"\nFetching data for ticker: {ticker}")
-        
-        # If date_split is not provided, use 1 year ago as the default split date
-        if date_split is None:
-            # Calculate date 1 year ago from today
-            today = datetime.datetime.now()
-            one_year_ago = (today - datetime.timedelta(days=365)).strftime('%Y-%m-%d')
-            date_split = one_year_ago
-            print(f"Using default date split: {date_split} (1 year ago)")
-        
-        # Fetch all historical data
-        data_file = collect_and_save_stock_data(
-            ticker, 
-            period="max",  # Get maximum available history
-            interval="1d",  # Daily data
-            output_format="csv"
-        )
+        # Get backtest data or regular stock data if backtest is missing
+        data_file, date_split = get_backtest_data(ticker, use_backtest=True, date_split=date_split, force_refresh=force_refresh)
         
         if data_file is None:
             print(f"Error: Failed to fetch data for {ticker}")
@@ -778,8 +1163,18 @@ def run_nn_prediction(ticker=None, data_file=None, feature_cols=None, sequence_l
     title = f"{ticker} Neural Network Model Predictions vs Actual" if ticker else "Neural Network Model Predictions vs Actual"
     plot_predictions(y_true, y_pred, title=title)
     
-    # Backtest strategy
-    backtest_data = backtest_strategy(data, y_pred)
+    # Backtest strategy with adaptive risk management
+    backtest_data = backtest_strategy(
+        data, y_pred, 
+        use_adaptive_risk=use_adaptive_risk,
+        max_position_size=max_position_size,
+        min_position_size=min_position_size,
+        base_stop_loss=base_stop_loss,
+        base_take_profit=base_take_profit,
+        volatility_window=volatility_window,
+        min_risk_reward_ratio=min_risk_reward_ratio,
+        max_portfolio_heat=max_portfolio_heat
+    )
     
     # Plot backtest results
     title = f"{ticker} Neural Network Trading Strategy Backtest Results" if ticker else "Neural Network Trading Strategy Backtest Results"
@@ -887,7 +1282,7 @@ if __name__ == "__main__":
     print(f"Testing on data from {one_year_ago} to present")
     
     # Run LSTM prediction with ticker-based data fetching and date-based split
-    print("\n=== Running LSTM Prediction ===\n")
+    print("\n=== Running LSTM Prediction with Adaptive Risk Management ===\n")
     lstm_model, lstm_backtest = run_lstm_prediction(
         ticker=ticker,
         feature_cols=['Open', 'High', 'Low', 'Close', 'Volume'],
@@ -896,7 +1291,16 @@ if __name__ == "__main__":
         lstm_units=50,
         dropout_rate=0.2,
         epochs=50,
-        batch_size=32
+        batch_size=32,
+        force_refresh=True,  # Always get fresh data
+        use_adaptive_risk=True,  # Enable adaptive risk management
+        max_position_size=1.0,
+        min_position_size=0.1,
+        base_stop_loss=0.02,
+        base_take_profit=0.04,
+        volatility_window=20,
+        min_risk_reward_ratio=1.5,
+        max_portfolio_heat=0.8
     )
     
     # Clear GPU cache if available
@@ -905,7 +1309,7 @@ if __name__ == "__main__":
         print(f"GPU Memory after LSTM: {torch.cuda.memory_allocated() / 1e9:.2f} GB used")
     
     # Run Neural Network prediction with ticker-based data fetching and date-based split
-    print("\n=== Running Neural Network Prediction ===\n")
+    print("\n=== Running Neural Network Prediction with Adaptive Risk Management ===\n")
     nn_model, nn_backtest = run_nn_prediction(
         ticker=ticker,
         feature_cols=['Open', 'High', 'Low', 'Close', 'Volume'],
@@ -914,7 +1318,16 @@ if __name__ == "__main__":
         layers=[64, 32],
         dropout_rate=0.2,
         epochs=50,
-        batch_size=32
+        batch_size=32,
+        force_refresh=True,  # Always get fresh data
+        use_adaptive_risk=True,  # Enable adaptive risk management
+        max_position_size=1.0,
+        min_position_size=0.1,
+        base_stop_loss=0.02,
+        base_take_profit=0.04,
+        volatility_window=20,
+        min_risk_reward_ratio=1.5,
+        max_portfolio_heat=0.8
     )
     
     # Clear GPU cache if available
